@@ -12,6 +12,10 @@ import torch
 import torch.distributed as dist
 import torch.sagemaker as tsm
 import torch.utils.data
+
+import transformer_engine
+from transformer_engine.common.recipe import Format, DelayedScaling
+
 import transformers
 from accelerate import init_empty_weights
 from checkpoints import (
@@ -31,6 +35,7 @@ from logging_utils import (
     log_and_write_eval_metrics,
     log_train_metrics,
     show_env_vars,
+    write_nccl_test_stats,
     write_metrics_train_step,
 )
 from memory_tracker import memory_status, memory_status_cpu
@@ -55,6 +60,7 @@ from train_utils import (
     patch_neox_rope,
 )
 from transformers import set_seed
+import utils
 
 logger = get_logger()
 
@@ -105,8 +111,9 @@ def reduce_loss(loss):
     return loss_scalar
 
 
-def train_step(
-    args, batch_idx, nvtx_warmup_iters, data_pipeline, input_data, model, optimizer, lr_scheduler
+def train_step(  # pylint: disable=too-many-arguments,too-many-branches,too-many-locals
+    args, display_step: int, batch_idx: int, nvtx_warmup_iters,
+    data_pipeline, input_data, model, optimizer, lr_scheduler, writers, fp8_recipe
 ):
     if batch_idx >= nvtx_warmup_iters:
         torch.cuda.nvtx.range_push(f"iteration{batch_idx}")
@@ -131,15 +138,19 @@ def train_step(
         torch.cuda.nvtx.range_push("forward")
 
     # uses default causal mask
-    loss = model(input_ids=input_ids, attention_mask=None, labels=labels)["loss"]
+    if args.fp8==1 and args.use_smp_implementation==1:
+        with transformer_engine.pytorch.fp8_autocast(enabled=args.fp8, fp8_recipe=fp8_recipe, fp8_group=tsm.state.world_process_group):
+            loss = model(input_ids=input_ids, attention_mask=None, labels=labels)["loss"]
+    else:
+        loss = model(input_ids=input_ids, attention_mask=None, labels=labels)["loss"]
 
     if batch_idx >= nvtx_warmup_iters:
         # for forward
         torch.cuda.nvtx.range_pop()
 
     if args.enable_memory_profiling > 0 and batch_idx < 5:
-        memory_status_cpu("After_forward_cpu")
-        memory_status(msg="After_forward")
+        memory_status_cpu("After forward", writers=writers, step=display_step)
+        memory_status(tag="After forward", writers=writers, step=display_step)
 
     if batch_idx >= nvtx_warmup_iters:
         torch.cuda.nvtx.range_push("backward")
@@ -151,8 +162,8 @@ def train_step(
         torch.cuda.nvtx.range_pop()
 
     if args.enable_memory_profiling > 0 and batch_idx < 5:
-        memory_status_cpu("After_train_step_cpu")
-        memory_status(msg="After_train_step")
+        memory_status_cpu("After train step", writers=writers, step=display_step)
+        memory_status(tag="After train step", writers=writers, step=display_step)
 
     if batch_idx >= nvtx_warmup_iters:
         torch.cuda.nvtx.range_push("opt_step")
@@ -177,7 +188,7 @@ def train_step(
     step_time = time.time() - step_start
 
     if args.enable_memory_profiling > 0 and batch_idx < 5:
-        memory_status(msg="After_opt_step")
+        memory_status(tag="After opt step", writers=writers, step=display_step)
 
     batch_num_sequences = input_ids.shape[0]
     batch_seqlen = input_ids.shape[1]
@@ -194,16 +205,18 @@ def train(
     start_epoch,
     start_train_path_index,
     resume_from_sequence_number,
+    val_resume_from_sequence_number,
     num_params,
     total_steps,
     args,
     global_rank,
     world_size,
     checkpointing_pg_metadata,
+    fp8_recipe,
 ):
     """Train."""
     if args.enable_memory_profiling > 0:
-        memory_status_cpu(msg="before train step")
+        memory_status_cpu(tag="Before train step", writers=writers, step=total_steps - 1)
 
     model.train()
     dp_rank = global_rank
@@ -221,9 +234,10 @@ def train(
     set_seed(args.seed)
 
     data_pipeline = create_data_pipeline(
-        args, start_train_path_index, resume_from_sequence_number, dp_rank, dp_size
+        args, start_train_path_index, resume_from_sequence_number, val_resume_from_sequence_number, dp_rank, dp_size
     )
     cur_seq_index = resume_from_sequence_number
+    cur_val_seq_index = val_resume_from_sequence_number
     epoch = start_epoch
     while total_steps < args.max_steps:
         nvtx_warmup_iters = 3
@@ -244,6 +258,7 @@ def train(
 
             loss, step_time, batch_num_sequences, batch_seqlen, grad_norm = train_step(
                 args,
+                total_steps,
                 batch_idx,
                 nvtx_warmup_iters,
                 data_pipeline,
@@ -251,6 +266,8 @@ def train(
                 model,
                 optimizer,
                 lr_scheduler,
+                writers,
+                fp8_recipe,
             )
             total_steps += 1
             cur_seq_index += batch_num_sequences
@@ -258,7 +275,7 @@ def train(
             throughput = sample_processed / step_time
             throughputs.append(throughput)
 
-            tflops_per_gpu = compute_tflops(throughput, num_params, world_size, batch_seqlen)
+            tflops_per_gpu = compute_tflops(args, sample_processed, step_time, world_size)
 
             if not total_steps % args.logging_freq and args.log_reduced_training_loss > 0:
                 loss_scalar = reduce_loss(loss)
@@ -298,6 +315,7 @@ def train(
                 cur_state = np.random.get_state()
                 torch.cuda.empty_cache()
                 val_loss, val_ppl = eval_model(model, data_pipeline, args.validation_batches)
+                cur_val_seq_index += args.val_batch_size * args.validation_batches
                 if global_rank == 0:
                     log_and_write_eval_metrics(writers, display_step, val_loss, val_ppl)
                 model = model.train()
@@ -312,6 +330,7 @@ def train(
                 else:
                     save_train_path_index = 0
                 save_train_seq_index = cur_seq_index
+                save_val_seq_index = cur_val_seq_index
                 # technically we have processed save_train_seq_index sequences in this file
                 # and so index to start from is save_train_seq_index
                 user_content = {
@@ -322,6 +341,7 @@ def train(
                     "epoch": epoch,
                     "start_train_path_index": save_train_path_index,
                     "resume_from_sequence_number": save_train_seq_index,
+                    "val_resume_from_sequence_number": save_val_seq_index,
                 }
 
                 subdir = f"{args.model_type}-{total_steps}steps"
@@ -333,7 +353,7 @@ def train(
 
                 if args.enable_memory_profiling > 0:
                     msg = f"({_DEFAULT_STATE_DICT_TYPE})"
-                    memory_status(msg=f"Before ckpt @{display_step} {msg}")
+                    memory_status(tag=f"Before ckpt {msg}", writers=writers, step=display_step)
                 save_checkpoint(
                     model,
                     optimizer,
@@ -345,11 +365,12 @@ def train(
                     args.num_kept_checkpoints[0],
                     checkpointing_pg_metadata,
                     tensor_parallel_degree=int(tsm.state.tensor_parallel_degree),
+                    expert_parallel_degree=int(tsm.state.expert_parallel_degree),
                     checkpoint_type=args.checkpoint_type,
                 )
                 if args.enable_memory_profiling > 0:
                     msg = f"({_DEFAULT_STATE_DICT_TYPE})"
-                    memory_status(msg=f"After ckpt  @{display_step} {msg}")
+                    memory_status(tag=f"After ckpt {msg}", writers=writers, step=display_step)
 
         if isinstance(data_pipeline, GPTDataPipeline):
             incremented_in_epoch = data_pipeline.increment_path_in_epoch()
@@ -365,6 +386,8 @@ def train(
 @record
 def main(args):
     """Main function to train GPT."""
+    global_start_time = time.time()
+
     # Sanity check for args.
     # - Checkpoints.
     # TODO(sliuxl): Supporting one single checkpoint dir now, and multiple dirs support is missing.
@@ -395,6 +418,10 @@ def main(args):
     else:
         writers = ()
 
+    if args.nccl_test_log:
+        report = utils.get_nccl_test_report(utils.parse_nccl_test_log(args.nccl_test_log))
+        if report is not None and global_rank == 0:
+            write_nccl_test_stats(writers, report)
 
     tsm.init()
 
@@ -428,12 +455,12 @@ def main(args):
             * args.train_batch_size
             / tsm.state.tensor_parallel_degree
         )
-        logger.info("Global batch size in tokens: %10d (%5.2fM).", gbs, gbs / 1e6)
+        logger.info("Global batch size in tokens: %10d (%5.2fM).", gbs, gbs / 1024 ** 2)
 
     set_seed(args.seed)
 
     if args.enable_memory_profiling > 0:
-        memory_status_cpu(msg="before model creation")
+        memory_status_cpu(tag="Before model creation", writers=writers)
 
     if args.bf16:
         dtype = torch.bfloat16
@@ -445,11 +472,10 @@ def main(args):
 
         # Using config for finetune mode, else uses args to create model
         model_config = AutoConfig.from_pretrained(args.hf_pretrained_model_name_or_dir)
+        if hasattr(model_config, "use_cache"):
+             model_config.use_cache = False
     else:
         model_config = get_model_config(args)
-
-    if pversion.parse(transformers.__version__) >= pversion.parse("4.34.0"):
-        model_config._flash_attn_2_enabled = True
 
     delayed_param_initer = None
     with tsm_utils.timeit(True, "Model creation", global_rank):
@@ -488,12 +514,28 @@ def main(args):
             num_params = compute_num_params(model)
 
         if args.use_smp_implementation:
+            if args.moe:
+                from torch.sagemaker.moe.moe_config import MoEConfig
+                moe_config = MoEConfig(
+                    smp_moe=args.use_smp_implementation > 0,
+                    random_seed=args.seed,
+                    moe_load_balancing=args.moe_load_balancing,
+                    global_token_shuffle=args.global_token_shuffle > 0,
+                    moe_all_to_all_dispatcher=args.moe_all_to_all_dispatcher > 0,
+                    use_cpu_initialization=finetune_with_pretrained_weights_check(args) and dist.get_rank() == 0,
+                )
+            else:
+                moe_config = None
             load_state_dict_from_rank0 = finetune_with_pretrained_weights_check(args)
-            model = transform(model, load_state_dict_from_rank0=load_state_dict_from_rank0)
+            if args.moe and args.delayed_param and (not load_state_dict_from_rank0 or dist.get_rank() != 0):
+                with init_empty_weights():
+                    model = transform(model, config=moe_config, load_state_dict_from_rank0=load_state_dict_from_rank0)
+            else:
+                model = transform(model, config=moe_config, load_state_dict_from_rank0=load_state_dict_from_rank0)
 
         if args.delayed_param:
             # param init fn for delayed param creation
-            if finetune_check(args):
+            if finetune_with_pretrained_weights_check(args):
                 if dist.get_rank() != 0:
                     delayed_param_initer = DelayedParamIniter(model)
             else:
@@ -503,14 +545,13 @@ def main(args):
         [torch.float32]
     ), "Model parameters should be in fp32 for FSDP mixed precision"
 
-    start = time.time()
-
     if global_rank == 0:
         logger.info(
             "Created model with total parameters: %d (%.2f B)", num_params, num_params * 1e-9
         )
 
-    transformer_layer = get_transformer_layer(args.model_type, args.use_smp_implementation)
+    transformer_layer = get_transformer_layer(args.model_type, args.use_smp_implementation,
+                                              args.moe)
 
     if args.auto_wrap_policy == "transformer_auto_wrap_policy":
         gpt_auto_wrap_policy = functools.partial(
@@ -536,7 +577,7 @@ def main(args):
         mixed_precision_policy = None
 
     if args.enable_memory_profiling > 0:
-        memory_status_cpu(msg="before fsdp wrapper")
+        memory_status_cpu(tag="Before FSDP wrapper", writers=writers)
 
     sharding_strategy = get_sharding_strategy(args.sharding_strategy)
 
@@ -568,13 +609,16 @@ def main(args):
     # after the broadcast that happens when we use sync_module_states
     # This can be removed once the SMDDP issue is fixed
     dist.barrier()
-    memory_status(msg="After FSDP")
 
     if global_rank == 0:
         logger.info("Wrapped model with FSDP")
 
     if args.enable_memory_profiling > 0:
-        memory_status(msg="after fsdp wrapper")
+        memory_status(tag="After FSDP wrapper", writers=writers)
+
+    fp8_recipe = None
+    if args.fp8==1 and args.use_smp_implementation==1:
+        fp8_recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=args.fp8_amax_history_len, amax_compute_algo=args.fp8_amax_compute_algo)
 
     if args.activation_checkpointing > 0:
         apply_activation_checkpoint(args, model=model)
@@ -614,6 +658,7 @@ def main(args):
             total_steps,
             start_train_path_index,
             resume_from_sequence_number,
+            val_resume_from_sequence_number,
         ) = load_checkpoint(
             args,
             model,
@@ -623,16 +668,19 @@ def main(args):
             sharding_strategy,
             checkpointing_pg_metadata,
             tensor_parallel_degree=int(tsm.state.tensor_parallel_degree),
+            expert_parallel_degree=int(tsm.state.expert_parallel_degree),
             checkpoint_type=args.checkpoint_type,
         )
+        torch.cuda.empty_cache()
 
     else:
         total_steps = 0
         epoch = 0
         start_train_path_index = 0
         resume_from_sequence_number = 0
+        val_resume_from_sequence_number = 0
 
-    start = time.time()
+    train_start_time = time.time()
     # total_steps, throughput, loss
     total_steps, _ = train(
         model,
@@ -643,14 +691,18 @@ def main(args):
         epoch,
         start_train_path_index,
         resume_from_sequence_number,
+        val_resume_from_sequence_number,
         num_params,
         total_steps,
         args,
         global_rank,
         world_size,
         checkpointing_pg_metadata,
+        fp8_recipe,
     )
-    time_to_train = time.time() - start
+    time_now = time.time()
+    total_sec = time_now - global_start_time
+    train_sec = time_now - train_start_time
 
     dist.barrier()
 
@@ -666,11 +718,24 @@ def main(args):
             1,
             None,
             int(tsm.state.tensor_parallel_degree),
+            int(tsm.state.expert_parallel_degree),
             checkpoint_type=CheckpointingMethod.FULL,
         )
 
     if global_rank == 0:
+        train_min = train_sec / 60.0
+        total_min = total_sec / 60.0
+
+        for writer in writers:
+            runtime = {
+                "total": total_min,
+                "train": train_min,
+            }
+            writer.add_scalars("Perf/runtime", runtime, total_steps - 1)
+
         logger.info(
-            "FSDP training finished successfully %fs (%fmin).", time_to_train, time_to_train / 60.0
+            "FSDP training finished successfully %fs (%fmin) out of (%fmin).",
+            train_sec, train_min, total_min
         )
+
     dist.destroy_process_group()
